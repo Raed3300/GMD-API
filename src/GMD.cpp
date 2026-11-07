@@ -9,6 +9,16 @@
 using namespace geode::prelude;
 using namespace gmd;
 
+// The public API in GMD.hpp still uses std::filesystem::path, but the newer
+// Geode SDK file utilities take asp::fs::PathView, which can't be built from
+// a std::filesystem::path. So we convert to a UTF-8 std::string at the call
+// site and pass `.c_str()` (a const char*, same as a string literal) to the SDK.
+// Keep the std::string alive for the whole call!
+static std::string pathToUtf8(std::filesystem::path const& path) {
+    auto u8 = path.u8string();
+    return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
+}
+
 static std::string extensionWithoutDot(std::filesystem::path const& path) {
     auto ext = path.extension().string();
     if (ext.size()) {
@@ -27,6 +37,11 @@ static bool verifySongFileName(std::string const& name) {
     }
     return false;
 }
+
+// Compression level passed as the 4th argument of ZipUtils::ccDeflateMemory.
+// The current SDK requires 4 arguments. If the compiler complains about this
+// argument's type, check the "candidate function" note in the build log.
+static constexpr int DEFLATE_LEVEL = 9;
 
 ImportGmdFile::ImportGmdFile(
     std::filesystem::path const& path
@@ -65,13 +80,19 @@ geode::Result<std::string> ImportGmdFile::getLevelData() const {
             "file or the developer of the mod forgot to call inferType"
         );
     }
+
+    // keep alive for the duration of every SDK call below
+    auto const pathStr = pathToUtf8(m_path);
+
     switch (m_type.value()) {
         case GmdFileType::Gmd: {
-            return file::readString(m_path).mapErr([this](std::string err) { return fmt::format("Unable to read {}: {}", m_path, err); });
+            return file::readString(pathStr.c_str()).mapErr([&pathStr](std::string err) {
+                return fmt::format("Unable to read {}: {}", pathStr, err);
+            });
         } break;
     
         case GmdFileType::Lvl: {
-            GEODE_UNWRAP_INTO(auto data, file::readBinary(m_path));
+            GEODE_UNWRAP_INTO(auto data, file::readBinary(pathStr.c_str()));
             unsigned char* unzippedData;
             auto count = ZipUtils::ccInflateMemory(
                 data.data(),
@@ -91,8 +112,15 @@ geode::Result<std::string> ImportGmdFile::getLevelData() const {
 
         case GmdFileType::Gmd2: {
             try {
+                // Read the whole archive into memory and open it from bytes.
+                // `fileData` must outlive `unzip`, so keep it in this scope.
                 GEODE_UNWRAP_INTO(
-                    auto unzip, file::Unzip::create(m_path)
+                    auto fileData, file::readBinary(pathStr.c_str())
+                        .mapErr([](std::string err) { return fmt::format("Unable to read file: {}", err); })
+                );
+
+                GEODE_UNWRAP_INTO(
+                    auto unzip, file::Unzip::create(fileData)
                         .mapErr([](std::string err) { return fmt::format("Unable to read file: {}", err); })
                 );
 
@@ -120,7 +148,7 @@ geode::Result<std::string> ImportGmdFile::getLevelData() const {
                     }
 
                     GEODE_UNWRAP_INTO(
-                        auto songData, unzip.extract(songFile)
+                        auto songData, unzip.extract(songFile.c_str())
                             .mapErr([](std::string err) { return fmt::format("Unable to read song file: {}", err); })
                     );
 
@@ -143,7 +171,9 @@ geode::Result<std::string> ImportGmdFile::getLevelData() const {
                     if (std::filesystem::exists(oldSongPath)) {
                         std::filesystem::rename(songTargetPath, oldSongPath);
                     }
-                    (void)file::writeBinary(songTargetPath, songData);
+
+                    auto const songTargetStr = pathToUtf8(songTargetPath);
+                    (void)file::writeBinary(songTargetStr.c_str(), songData);
                 }
 
                 GEODE_UNWRAP_INTO(
@@ -241,7 +271,8 @@ geode::Result<ByteVector> ExportGmdFile::intoBytes() const {
             auto count = ZipUtils::ccDeflateMemory(
                 reinterpret_cast<unsigned char*>(data.data()),
                 data.size(),
-                &zippedData
+                &zippedData,
+                DEFLATE_LEVEL
             );
             if (!count) {
                 return Err("Unable to compress level data");
@@ -263,9 +294,16 @@ geode::Result<ByteVector> ExportGmdFile::intoBytes() const {
             auto json = matjson::Value();
             if (m_includeSong) {
                 auto path = std::filesystem::path(std::string(m_level->getAudioFileName()));
-                json["song-file"] = path.filename().string();
+                auto const pathStr = pathToUtf8(path);
+                auto const fileName = pathToUtf8(path.filename());
+
+                json["song-file"] = fileName;
                 json["song-is-custom"] = m_level->m_songID;
-                GEODE_UNWRAP(zip.addFrom(path));
+
+                // zip.addFrom(path) takes a PathView now, so read the song
+                // ourselves and add it as bytes instead
+                GEODE_UNWRAP_INTO(auto songData, file::readBinary(pathStr.c_str()));
+                GEODE_UNWRAP(zip.add(fileName.c_str(), songData));
             }
             GEODE_UNWRAP(zip.add("level.meta", json.dump()));
             GEODE_UNWRAP(zip.add("level.data", data));
@@ -281,7 +319,8 @@ geode::Result<ByteVector> ExportGmdFile::intoBytes() const {
 
 geode::Result<> ExportGmdFile::intoFile(std::filesystem::path const& path) const {
     GEODE_UNWRAP_INTO(auto data, this->intoBytes());
-    GEODE_UNWRAP(file::writeBinary(path, data));
+    auto const pathStr = pathToUtf8(path);
+    GEODE_UNWRAP(file::writeBinary(pathStr.c_str(), data));
     return Ok();
 }
 

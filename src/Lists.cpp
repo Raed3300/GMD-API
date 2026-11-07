@@ -9,6 +9,14 @@
 using namespace geode::prelude;
 using namespace gmd;
 
+// The newer Geode SDK file utilities take asp::fs::PathView, which can't be
+// built from a std::filesystem::path. Convert to a UTF-8 std::string and pass
+// `.c_str()` to the SDK instead. Keep the std::string alive for the whole call!
+static std::string pathToUtf8(std::filesystem::path const& path) {
+    auto u8 = path.u8string();
+    return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
+}
+
 struct ImportGmdList::Impl {
     std::filesystem::path path;
     GmdListFileType type = DEFAULT_GMD_LIST_TYPE;
@@ -30,8 +38,10 @@ ImportGmdList& ImportGmdList::setType(GmdListFileType type) {
 }
 
 Result<Ref<GJLevelList>> ImportGmdList::intoList() {
-    GEODE_UNWRAP_INTO(auto data, file::readString(m_impl->path)
-        .mapErr([this](std::string err) { return fmt::format("Unable to read {}: {}", m_impl->path, err); })
+    auto const pathStr = pathToUtf8(m_impl->path);
+
+    GEODE_UNWRAP_INTO(auto data, file::readString(pathStr.c_str())
+        .mapErr([&pathStr](std::string err) { return fmt::format("Unable to read {}: {}", pathStr, err); })
     );
     handlePlistDataForParsing(data);
 
@@ -78,7 +88,8 @@ geode::Result<geode::ByteVector> ExportGmdList::intoBytes() const {
 }
 geode::Result<> ExportGmdList::intoFile(std::filesystem::path const& path) const {
     GEODE_UNWRAP_INTO(auto data, this->intoBytes());
-    GEODE_UNWRAP(file::writeBinary(path, data));
+    auto const pathStr = pathToUtf8(path);
+    GEODE_UNWRAP(file::writeBinary(pathStr.c_str(), data));
     return Ok();
 }
 
